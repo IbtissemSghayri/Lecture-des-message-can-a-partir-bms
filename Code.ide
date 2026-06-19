@@ -1,0 +1,86 @@
+#include <SPI.h>
+#include <mcp_can.h>
+
+#define CAN_CS_PIN   5
+#define CAN_INT_PIN  4
+#define CAN_SPEED    CAN_250KBPS
+#define CAN_CLOCK    MCP_8MHZ
+
+MCP_CAN CAN(CAN_CS_PIN);
+
+#define BMS_REQUEST_ID   0x18FF28F4UL
+
+byte bmsRequestData[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+byte bmsRequestLen = 8;
+
+unsigned long lastRequestTime = 0;
+const unsigned long REQUEST_INTERVAL_MS = 250;
+
+void sendBmsRequest() {
+  byte sndStat = CAN.sendMsgBuf(BMS_REQUEST_ID, 1, bmsRequestLen, bmsRequestData);
+  if (sndStat == CAN_OK) {
+    Serial.println(">> Requete envoyee au BMS (ID 0x18FF28F4)");
+  } else {
+    Serial.print(">> Echec d'envoi de la requete, code erreur: ");
+    Serial.println(sndStat);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { ; }
+
+  pinMode(CAN_INT_PIN, INPUT);
+  Serial.println("Initialisation du module MCP2515...");
+
+  while (CAN.begin(MCP_ANY, CAN_SPEED, CAN_CLOCK) != CAN_OK) {
+    Serial.println("Echec de l'initialisation du MCP2515, nouvelle tentative...");
+    delay(500);
+  }
+
+  CAN.setMode(MCP_NORMAL);
+  Serial.println("MCP2515 initialise avec succes. En attente de messages CAN...");
+  Serial.println("-----------------------------------------------------------");
+}
+
+void loop() {
+  if (millis() - lastRequestTime >= REQUEST_INTERVAL_MS) {
+    sendBmsRequest();
+    lastRequestTime = millis();
+  }
+
+  if (CAN.checkReceive() == CAN_MSGAVAIL) {
+    long unsigned int rxId;
+    unsigned char len = 0;
+    unsigned char rxBuf[8];
+
+    CAN.readMsgBuf(&rxId, &len, rxBuf);
+
+    bool isExtended = (rxId & 0x80000000) != 0;
+    unsigned long idValue = isExtended ? (rxId & 0x1FFFFFFF) : (rxId & 0x7FF);
+
+    Serial.print("ID: 0x");
+    if (isExtended) {
+      char buf[9];
+      sprintf(buf, "%08lX", idValue);
+      Serial.print(buf);
+      Serial.print(" (etendu, 29 bits)");
+    } else {
+      char buf[4];
+      sprintf(buf, "%03lX", idValue);
+      Serial.print(buf);
+      Serial.print(" (standard, 11 bits)");
+    }
+
+    Serial.print("  | DLC: ");
+    Serial.print(len);
+
+    Serial.print("  | Data: ");
+    for (int i = 0; i < len; i++) {
+      if (rxBuf[i] < 0x10) Serial.print("0");
+      Serial.print(rxBuf[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+  }
+}
