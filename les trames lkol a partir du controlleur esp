@@ -1,0 +1,59 @@
+#include <SPI.h>
+#include <mcp_can.h>
+
+#define CAN_CS_PIN   5
+#define CAN_INT_PIN  4
+
+MCP_CAN CAN(CAN_CS_PIN);
+
+long unsigned int rxId;
+unsigned char     rxLen = 0;
+unsigned char     rxBuf[8];
+volatile bool     msgFlag = false;
+
+void IRAM_ATTR canISR() {
+  msgFlag = true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { delay(10); }
+
+  Serial.println("=== ESP32 CAN Sniffer — All IDs ===");
+
+  while (CAN.begin(MCP_ANY, CAN_250KBPS, MCP_8MHZ) != CAN_OK) {
+    Serial.println("[ERROR] MCP2515 init failed — retrying...");
+    delay(1000);
+  }
+  Serial.println("[OK] MCP2515 ready\n");
+
+  CAN.setMode(MCP_NORMAL);
+
+  // Masks = 0 → accept ALL IDs, filters are ignored
+  CAN.init_Mask(0, 0, 0x00000000);
+  CAN.init_Mask(1, 0, 0x00000000);
+
+  pinMode(CAN_INT_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(CAN_INT_PIN), canISR, FALLING);
+
+  Serial.println("Index  | ID         | DLC | Data");
+  Serial.println("-------|------------|-----|------------------------");
+}
+
+unsigned long msgIndex = 0;
+
+void loop() {
+  if (!msgFlag) return;
+  msgFlag = false;
+
+  while (CAN.checkReceive() == CAN_MSGAVAIL) {
+    if (CAN.readMsgBuf(&rxId, &rxLen, rxBuf) != CAN_OK) continue;
+
+    bool isExtended = (rxId & 0x80000000) ? true : false;
+    unsigned long canId = rxId & 0x1FFFFFFF;
+
+    Serial.printf("%-6lu | 0x%08X | %d   | ", msgIndex++, canId, rxLen);
+    for (int i = 0; i < rxLen; i++) Serial.printf("%02X ", rxBuf[i]);
+    Serial.printf(" [%s]\n", isExtended ? "EXT" : "STD");
+  }
+}
