@@ -1,3 +1,21 @@
+*\ === MCP2515 → ESP32 ===
+VCC   → 5V (ou 3.3V selon module)
+GND   → GND
+CS    → GPIO5
+SI (MOSI) → GPIO23
+SO (MISO) → GPIO19
+SCK   → GPIO18
+INT   → non connecté
+
+=== Capteur vitesse (PWM) → ESP32 ===
+Signal → GPIO2
+\*
+
+
+
+
+
+
 #include <SPI.h>
 #include <mcp2515.h>
 
