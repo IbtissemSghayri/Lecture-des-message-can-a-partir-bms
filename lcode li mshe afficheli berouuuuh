@@ -1,36 +1,304 @@
-Message (Enter to send message to 'ESP32 Dev Module' on 'COM8')
-New Line
-115200 baud
-16:19:24.802 -> ets Jul 29 2019 12:21:46
-16:19:24.802 -> 
-16:19:24.802 -> rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
-16:19:24.847 -> configsip: 0, SPIWP:0xee
-16:19:24.847 -> clk_drv:0x00,q_drv:0x00,d_drv:0x00,cs0_drv:0x00,hd_drv:0x00,wp_drv:0x00
-16:19:24.847 -> mode:DIO, clock div:1
-16:19:24.847 -> load:0x3fff0030,len:4876
-16:19:24.847 -> ho 0 tail 12 room 4
-16:19:24.847 -> load:0x40078000,len:16560
-16:19:24.847 -> load:0x40080400,len:3500
-16:19:24.847 -> entry 0x400805b4
-16:19:25.033 -> ========================================
-16:19:25.033 ->      BMS CAN DECODER - ESP32
-16:19:25.033 -> ========================================
-16:19:25.033 -> Waiting for CAN messages...
-16:19:25.033 -> 
-16:19:35.663 -> [10731ms] RAW: 0x0 [0] 
-16:19:35.663 -> Unknown CAN ID: 0x0
-16:19:35.710 -> 
-16:19:35.710 -> [10731ms] RAW: 0x0 [0] 
-16:19:35.710 -> Unknown CAN ID: 0x0
-16:19:35.710 -> 
-16:19:35.710 -> [10732ms] RAW: 0x1FFFFFF0 [0] 
-16:19:35.710 -> Unknown CAN ID: 0x1FFFFFF0
-16:19:35.710 -> 
-16:19:35.710 -> [10753ms] RAW: 0x1FFFFFFF [7] 00 00 00 00 00 00 00 
-16:19:35.710 -> Unknown CAN ID: 0x1FFFFFFF
-16:19:35.710 -> 
-16:19:35.710 -> [10769ms] RAW: 0x0 [0] 
-16:19:35.710 -> Unknown CAN ID: 0x0
-16:19:35.733 -> 
-16:19:35.733 -> [10774ms] RAW: 0x0 [0] 
-16:19:35.733 -> Unknown CAN ID: 0x0
+#include <SPI.h>
+#include <mcp2515.h>
+
+// ========================= ESP32 PINS =========================
+#define CAN_CS_PIN    5
+#define SPI_SCK_PIN  18
+#define SPI_MISO_PIN 19
+#define SPI_MOSI_PIN 23
+#define PWM_PIN       4
+
+// ========================= SPEED CONFIG =========================
+const float speedFactor = 0.13;   // km/h per Hz
+float g_speed = 0.0;
+unsigned long lastSpeedRead = 0;
+
+// ========================= SETUP MCP2515 =========================
+struct can_frame canMsg;
+MCP2515 mcp2515(CAN_CS_PIN);
+
+// Cell voltage tracking
+float cellVoltages[20] = { 0.0 };  // 20 cellules
+int cellCounter = 0;
+
+// Temperature tracking
+int temperatureProbes[16] = { 0 };
+int tempProbeCounter = 0;
+
+// ========================= PROTOTYPES =========================
+void decodeBasicInfo1();
+void decodeBasicInfo2();
+void decodeCellVoltages();
+void decodeTemperatureInfo();
+void decodeChargingDemand();
+void decodeChargerFeedback();
+void decodeBMSFaultCode(byte faultCode, byte faultLevel);
+void quickFaultCheck(byte faultCode, byte faultLevel);
+void printRawMessage();
+void printHeader(const char* title);
+void printField(const char* name, const char* value, const char* unit = "");
+void printFieldFloat(const char* name, float value, const char* unit = "", int decimals = 1);
+void readSpeedPWM();
+
+// ========================= SETUP =========================
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  // Initialisation spécifique du Bus SPI sur ESP32
+  SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN, CAN_CS_PIN);
+
+  // Initialisation MCP2515
+  mcp2515.reset();
+  // Ajustez MCP_8MHZ ou MCP_16MHZ selon le quartz de votre module MCP2515
+  mcp2515.setBitrate(CAN_250KBPS, MCP_8MHZ);
+  mcp2515.setNormalMode();
+
+  pinMode(PWM_PIN, INPUT);
+
+  Serial.println("========================================");
+  Serial.println("     BMS CAN DECODER - ESP32");
+  Serial.println("========================================");
+  Serial.println("Waiting for CAN messages...\n");
+}
+
+// ========================= LOOP PRINCIPAL =========================
+void loop() {
+  // 1. Lecture CAN
+  if (mcp2515.readMessage(&canMsg) == MCP2515::ERROR_OK) {
+    printRawMessage();
+
+    // Masquage de l'ID pour ignorer les flags étendus lors de la comparaison
+    uint32_t cleanId = canMsg.can_id & 0x1FFFFFFF;
+
+    switch (cleanId) {
+      case 0x18FF28F4:
+      case 0x18FF28F4 | CAN_EFF_FLAG:
+        decodeBasicInfo1();
+        break;
+
+      case 0x18FE28F4:
+      case 0x18FE28F4 | CAN_EFF_FLAG:
+        decodeBasicInfo2();
+        break;
+
+      case 0x18FFE5F4:
+      case 0x18FFE5F4 | CAN_EFF_FLAG:
+        decodeChargingDemand();
+        break;
+
+      case 0x18FF50E5:
+      case 0x18FF50E5 | CAN_EFF_FLAG:
+        decodeChargerFeedback();
+        break;
+
+      default:
+        // Extraction du PF byte pour déterminer le type de message
+        byte pf = (cleanId >> 16) & 0xFF;
+
+        // Messages de tension des cellules
+        if (pf >= 0xC8 && pf <= 0xCC) {
+          decodeCellVoltages();
+        }
+        // Messages de température
+        else if (pf >= 0xB4 && pf <= 0xC6) {
+          decodeTemperatureInfo();
+        }
+        else {
+          Serial.print("Unknown CAN ID: 0x");
+          Serial.println(cleanId, HEX);
+        }
+        break;
+    }
+    Serial.println();
+  }
+}
+
+// ========================= FONCTIONS D'AFFICHAGE =========================
+void printRawMessage() {
+  Serial.print("[");
+  Serial.print(millis());
+  Serial.print("ms] RAW: 0x");
+  Serial.print(canMsg.can_id & 0x1FFFFFFF, HEX);
+  Serial.print(" [");
+  Serial.print(canMsg.can_dlc);
+  Serial.print("] ");
+  for (int i = 0; i < canMsg.can_dlc; i++) {
+    if (canMsg.data[i] < 0x10) Serial.print("0");
+    Serial.print(canMsg.data[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+}
+
+void printHeader(const char* title) {
+  Serial.println("\n========================================");
+  Serial.print("  ");
+  Serial.println(title);
+  Serial.println("========================================");
+}
+
+void printField(const char* name, const char* value, const char* unit) {
+  Serial.print(name);
+  Serial.print(": ");
+  Serial.print(value);
+  Serial.println(unit);
+}
+
+void printFieldFloat(const char* name, float value, const char* unit, int decimals) {
+  Serial.print(name);
+  Serial.print(": ");
+  Serial.print(value, decimals);
+  Serial.println(unit);
+}
+
+// ========================= FONCTIONS DE DECODAGE =========================
+
+// --- BMS Basic Info 1 ---
+void decodeBasicInfo1() {
+  printHeader("BMS BASIC INFORMATION 1 [100ms cycle]");
+
+  byte status = canMsg.data[0];
+  Serial.print("Cable connected: "); Serial.println((status & 0x01) ? "YES" : "NO");
+  Serial.print("Charging status: "); Serial.println((status & 0x02) ? "CHARGING" : "NOT CHARGING");
+  Serial.print("Low power: "); Serial.println((status & 0x04) ? "YES" : "NO");
+  Serial.print("Pack ready: "); Serial.println((status & 0x08) ? "READY" : "NOT READY");
+  Serial.print("Discharge contactor: "); Serial.println((status & 0x10) ? "CLOSED" : "OPEN");
+  Serial.print("Charge contactor: "); Serial.println((status & 0x20) ? "CLOSED" : "OPEN");
+
+  byte soc = canMsg.data[1];
+  Serial.print("State of Charge: "); Serial.print(soc); Serial.print("%");
+  if (soc < 20) Serial.println(" [LOW]");
+  else if (soc < 50) Serial.println(" [MEDIUM]");
+  else Serial.println(" [GOOD]");
+
+  uint16_t currentRaw = (canMsg.data[3] << 8) | canMsg.data[2];
+  float current = (currentRaw - 5000) * 0.1;
+  Serial.print("Current: "); Serial.print(current, 1); 
+  Serial.println(current >= 0 ? " [CHARGING/IDLE]" : " [DISCHARGING]");
+
+  uint16_t voltageRaw = (canMsg.data[5] << 8) | canMsg.data[4];
+  float voltage = voltageRaw * 0.1;
+  printFieldFloat("Voltage", voltage, "V");
+
+  byte faultLevel = canMsg.data[6];
+  byte faultCode = canMsg.data[7];
+
+  Serial.print("Fault level: "); Serial.println(faultLevel);
+  Serial.print("Fault code: 0x"); Serial.println(faultCode, HEX);
+
+  // Décodage des fautes
+  decodeBMSFaultCode(faultCode, faultLevel);
+}
+
+// --- BMS Basic Info 2 ---
+void decodeBasicInfo2() {
+  printHeader("BMS BASIC INFORMATION 2 [100ms cycle]");
+
+  uint16_t maxCellRaw = (canMsg.data[1] << 8) | canMsg.data[0];
+  uint16_t minCellRaw = (canMsg.data[3] << 8) | canMsg.data[2];
+  float maxCell = maxCellRaw / 1000.0;
+  float minCell = minCellRaw / 1000.0;
+  float imbalance = maxCell - minCell;
+
+  printFieldFloat("Max cell voltage", maxCell, "V", 3);
+  printFieldFloat("Min cell voltage", minCell, "V", 3);
+  Serial.print("Cell imbalance: "); Serial.print(imbalance, 3); Serial.println("V");
+
+  int maxTemp = canMsg.data[4] - 40;
+  int minTemp = canMsg.data[5] - 40;
+  Serial.print("Max temperature: "); Serial.println(maxTemp);
+  Serial.print("Min temperature: "); Serial.println(minTemp);
+
+  uint16_t maxDischargeRaw = (canMsg.data[7] << 8) | canMsg.data[6];
+  float maxDischarge = maxDischargeRaw * 0.1;
+  printFieldFloat("Max discharge", maxDischarge, "A");
+}
+
+// --- Cell Voltages ---
+void decodeCellVoltages() {
+  byte pf = ((canMsg.can_id & 0x1FFFFFFF) >> 16) & 0xFF;
+  int baseCell = (pf - 0xC8) * 4;
+
+  if (pf == 0xC8) printHeader("CELL VOLTAGE DETAILS [500ms cycle]");
+
+  for (int i = 0; i < 8; i += 2) {
+    int cellIndex = baseCell + (i / 2);
+    if (cellIndex >= 19) break;
+
+    uint16_t raw = (canMsg.data[i] << 8) | canMsg.data[i + 1];
+    float voltage = raw / 1000.0;
+    cellVoltages[cellIndex] = voltage;
+
+    Serial.print("Cell "); 
+    Serial.print(cellIndex + 1); 
+    Serial.print(": "); 
+    Serial.print(voltage, 3); 
+    Serial.println("V");
+  }
+}
+
+// --- Temperature ---
+void decodeTemperatureInfo() {
+  byte pf = ((canMsg.can_id & 0x1FFFFFFF) >> 16) & 0xFF;
+  if (pf != 0xB4) return;
+
+  printHeader("TEMPERATURE DETAILS [500ms cycle]");
+  tempProbeCounter = 0;
+
+  for (int i = 0; i < 3; i++) {
+    int temp = canMsg.data[i] - 40;
+    temperatureProbes[tempProbeCounter] = temp;
+    Serial.print("Temperature probe "); Serial.print(tempProbeCounter + 1); Serial.print(": "); Serial.println(temp);
+    tempProbeCounter++;
+  }
+}
+
+// --- Charging Demand ---
+void decodeChargingDemand() {
+  printHeader("CHARGING DEMAND [1000ms cycle]");
+  uint16_t targetVRaw = (canMsg.data[1] << 8) | canMsg.data[0];
+  uint16_t targetIRaw = (canMsg.data[3] << 8) | canMsg.data[2];
+
+  printFieldFloat("Target voltage", targetVRaw * 0.1, "V");
+  printFieldFloat("Target current", targetIRaw * 0.1, "A");
+}
+
+// --- Charger Feedback ---
+void decodeChargerFeedback() {
+  printHeader("CHARGER FEEDBACK [1000ms cycle]");
+  uint16_t outputVRaw = (canMsg.data[1] << 8) | canMsg.data[0];
+  uint16_t outputIRaw = (canMsg.data[3] << 8) | canMsg.data[2];
+
+  printFieldFloat("Output voltage", outputVRaw * 0.1, "V");
+  printFieldFloat("Output current", outputIRaw * 0.1, "A");
+}
+
+// --- Decode BMS Fault ---
+void decodeBMSFaultCode(byte faultCode, byte faultLevel) {
+  Serial.println("\n--- BMS FAULT ANALYSIS ---");
+  if (faultCode == 0 && faultLevel == 0) { Serial.println("No faults"); return; }
+  Serial.print("Fault Level: "); Serial.println(faultLevel);
+  Serial.print("Fault Code: "); Serial.println(faultCode, HEX);
+}
+
+// --- Quick Fault Check ---
+void quickFaultCheck(byte faultCode, byte faultLevel) {
+  if (faultCode == 0 && faultLevel == 0) return;
+  Serial.print("[FAULT] Level:"); Serial.print(faultLevel); Serial.print(" Code:0x"); Serial.println(faultCode, HEX);
+}
+
+// --- Lecture Vitesse PWM ---
+void readSpeedPWM() {
+  unsigned long highTime = pulseIn(PWM_PIN, HIGH, 50000);
+  unsigned long lowTime  = pulseIn(PWM_PIN, LOW, 50000);
+
+  if (highTime > 0 && lowTime > 0) {
+    float period = highTime + lowTime;   // µs
+    float frequency = 1000000.0 / period;
+    g_speed = frequency * speedFactor;
+    g_speed = constrain(g_speed, 0.0, 45.0);
+  } else {
+    g_speed = 0.0;
+  }
+}
