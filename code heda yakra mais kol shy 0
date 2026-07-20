@@ -1,0 +1,143 @@
+#include <SPI.h>
+#include <mcp2515.h>
+
+// ================== PIN ==================
+#define CAN_CS_PIN   5
+#define PWM_PIN      34
+
+// ================== REQUEST ==================
+#define REQUEST_ID     0x18FF28F4
+#define REQUEST_PERIOD 500   // ms entre chaque requête envoyée à la BMS
+
+unsigned long lastRequestTime = 0;
+
+// ================== SPEED ==================
+const float speedFactor = 0.13;
+float g_speed = 0.0;
+
+// ================== CAN ==================
+struct can_frame canMsg;
+struct can_frame requestFrame;
+MCP2515 mcp2515(CAN_CS_PIN);
+
+// ================== BASIC BMS ==================
+uint8_t g_soc = 0;
+float   g_voltage = 0.0;
+float   g_current = 0.0;
+uint8_t g_faultLevel = 0;
+uint8_t g_faultCode  = 0;
+
+// ================== CELLS ==================
+float cellVoltages[16];
+int temperatures[8];
+
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(PWM_PIN, INPUT);
+
+  mcp2515.reset();
+  mcp2515.setBitrate(CAN_250KBPS, MCP_8MHZ);
+  mcp2515.setNormalMode();
+
+  // Prépare la trame de requête (identifiant étendu 29 bits)
+  requestFrame.can_id  = REQUEST_ID | CAN_EFF_FLAG;
+  requestFrame.can_dlc = 8;
+  for (int i = 0; i < 8; i++) requestFrame.data[i] = 0x00;
+}
+
+// =====================================================
+void loop() {
+
+  readSpeedPWM();
+  sendRequestIfNeeded();
+
+  if (mcp2515.readMessage(&canMsg) == MCP2515::ERROR_OK) {
+
+    uint8_t pf = (canMsg.can_id >> 16) & 0xFF;
+
+    if (canMsg.can_id == 0x98FF28F4) decodeBasicInfo1();
+    else if (pf >= 0xC8 && pf <= 0xCC) decodeCellVoltages();
+    else if (pf == 0xB4) decodeTemperatureInfo();
+
+    printOneLine();
+  }
+}
+
+// =====================================================
+void sendRequestIfNeeded() {
+  unsigned long now = millis();
+  if (now - lastRequestTime >= REQUEST_PERIOD) {
+    lastRequestTime = now;
+    mcp2515.sendMessage(&requestFrame);
+  }
+}
+
+// =====================================================
+void readSpeedPWM() {
+  unsigned long highTime = pulseIn(PWM_PIN, HIGH, 100000);
+  unsigned long lowTime  = pulseIn(PWM_PIN, LOW, 100000);
+
+  if (highTime > 0 && lowTime > 0) {
+    float freq = 1000000.0 / (highTime + lowTime);
+    g_speed = constrain(freq * speedFactor, 0, 45);
+  } else g_speed = 0;
+}
+
+// =====================================================
+void decodeBasicInfo1() {
+  g_soc = canMsg.data[1];
+  uint16_t currentRaw = (canMsg.data[3] << 8) | canMsg.data[2];
+  g_current = (currentRaw - 5000) * 0.1;
+  uint16_t voltageRaw = (canMsg.data[5] << 8) | canMsg.data[4];
+  g_voltage = voltageRaw * 0.1;
+  g_faultLevel = canMsg.data[6];
+  g_faultCode  = canMsg.data[7];
+}
+
+// =====================================================
+void decodeCellVoltages() {
+  byte pf = (canMsg.can_id >> 16) & 0xFF;
+  int baseCell = (pf - 0xC8) * 4;
+
+  for (int i = 0; i < 8; i += 2) {
+    int idx = baseCell + (i / 2);
+    if (idx >= 16) break;
+    uint16_t raw = (canMsg.data[i] << 8) | canMsg.data[i + 1];
+    cellVoltages[idx] = raw / 1000.0;
+  }
+}
+
+// =====================================================
+void decodeTemperatureInfo() {
+  for (int i = 0; i < 3; i++) {
+    temperatures[i] = canMsg.data[i] - 40;
+  }
+}
+
+// =====================================================
+void printOneLine() {
+  Serial.print("SOC=");
+  Serial.print(g_soc);
+  Serial.print("% V=");
+  Serial.print(g_voltage,1);
+  Serial.print(" I=");
+  Serial.print(g_current,1);
+  Serial.print(" Speed=");
+  Serial.print(g_speed,1);
+
+  for (int i = 0; i < 16; i++) {
+    Serial.print(" C"); Serial.print(i+1);
+    Serial.print("="); Serial.print(cellVoltages[i],3);
+  }
+
+  for (int i = 0; i < 3; i++) {
+    Serial.print(" T"); Serial.print(i+1);
+    Serial.print("="); Serial.print(temperatures[i]);
+  }
+
+  Serial.print(" Fault=");
+  Serial.print(g_faultLevel);
+  Serial.print(":");
+  Serial.println(g_faultCode, HEX);
+}
